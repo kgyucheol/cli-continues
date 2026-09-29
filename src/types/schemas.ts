@@ -65,7 +65,9 @@ export const CodexSessionMetaSchema = z
             sha: z.string().optional(),
           })
           .optional(),
-        source: z.string().optional(),
+        // Codex Desktop subagent threads use an object, e.g. { subagent: { other: 'guardian' } }
+        source: z.union([z.string(), z.record(z.string(), z.unknown())]).optional(),
+        thread_source: z.string().optional(),
         originator: z.string().optional(),
         cli_version: z.string().optional(),
         model_provider: z.string().optional(),

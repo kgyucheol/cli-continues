@@ -366,7 +366,9 @@ describe('codex parser hardening', () => {
       cliVersion: '0.99.0',
       modelProvider: 'openai',
     });
-    expect(context.markdown).toContain('Lifecycle task_started');
+    // task_started/task_complete carry no content; only interruptions are worth a slot in Recent Conversation
+    expect(context.markdown).toContain('Lifecycle turn_aborted');
+    expect(context.markdown).not.toContain('Lifecycle task_started');
     expect(context.markdown).not.toContain('### Task');
   });
 
@@ -405,5 +407,227 @@ describe('codex parser hardening', () => {
     expect(originalPath).toContain('shaonly-session-id');
     expect(session.gitSha).toBe('fedcba0987654321');
     expect(context.sessionNotes?.sourceMetadata).toMatchObject({ gitSha: 'fedcba0987654321' });
+  });
+});
+
+// Shapes below mirror real Codex Desktop rollouts (cli_version 0.153): tools run inside an `exec`
+// JS wrapper, and the structured result of each tool lands in `event_msg` → `item_completed`.
+describe('codex desktop rollout format', () => {
+  const desktopMeta = (id: string, extra: Record<string, unknown> = {}) => ({
+    timestamp: '2026-09-28T10:00:00.000Z',
+    ordinal: 0,
+    type: 'session_meta',
+    payload: {
+      session_id: id,
+      id,
+      timestamp: '2026-09-28T10:00:00.000Z',
+      cwd: '/tmp/desktop-project',
+      originator: 'Codex Desktop',
+      cli_version: '0.153.0-alpha.5',
+      source: 'vscode',
+      thread_source: 'user',
+      model_provider: 'openai',
+      ...extra,
+    },
+  });
+
+  const userItem = (timestamp: string, text: string) => ({
+    timestamp,
+    type: 'response_item',
+    payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] },
+  });
+
+  const assistantItem = (timestamp: string, text: string) => ({
+    timestamp,
+    type: 'response_item',
+    payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text }] },
+  });
+
+  const completed = (timestamp: string, item: Record<string, unknown>) => ({
+    timestamp,
+    type: 'event_msg',
+    payload: { type: 'item_completed', thread_id: 'desktop-thread', turn_id: 'turn-1', item },
+  });
+
+  it('uses the first real user request as summary, skipping injected context messages', async () => {
+    const home = makeCodexHome();
+    writeRollout(home, path.join('sessions', '2026', '09', '28'), 'rollout-2026-09-28T10-00-00-desktop-thread.jsonl', [
+      desktopMeta('desktop-thread'),
+      userItem(
+        '2026-09-28T10:00:01.000Z',
+        '# AGENTS.md instructions for /tmp/desktop-project\n\n<INSTRUCTIONS>x</INSTRUCTIONS>',
+      ),
+      userItem(
+        '2026-09-28T10:00:01.100Z',
+        '<environment_context>\n  <cwd>/tmp/desktop-project</cwd>\n</environment_context>',
+      ),
+      userItem('2026-09-28T10:00:01.200Z', '<in-app-browser-context>tabs</in-app-browser-context>'),
+      userItem('2026-09-28T10:00:02.000Z', '씬 트리에 다중 선택을 추가해줘'),
+      assistantItem('2026-09-28T10:00:03.000Z', '다중 선택을 추가하겠습니다.'),
+    ]);
+
+    const { parseCodexSessions, extractCodexContext } = await loadCodexParser(home);
+    const [session] = await parseCodexSessions();
+    const context = await extractCodexContext(session);
+
+    expect(session.summary).toBe('씬 트리에 다중 선택을 추가해줘');
+    expect(context.recentMessages.map((m) => m.content)).toEqual([
+      '씬 트리에 다중 선택을 추가해줘',
+      '다중 선택을 추가하겠습니다.',
+    ]);
+  });
+
+  it('skips guardian_review subagent sessions (auto-approval reviewers are not user work)', async () => {
+    const home = makeCodexHome();
+    const dir = path.join('sessions', '2026', '09', '28');
+    writeRollout(home, dir, 'rollout-2026-09-28T10-00-00-user-thread.jsonl', [
+      desktopMeta('user-thread'),
+      userItem('2026-09-28T10:00:02.000Z', 'real work'),
+    ]);
+    writeRollout(home, dir, 'rollout-2026-09-28T10-05-00-guardian-thread.jsonl', [
+      desktopMeta('guardian-thread', {
+        source: { subagent: { other: 'guardian' } },
+        thread_source: 'guardian_review',
+        parent_thread_id: 'user-thread',
+      }),
+      userItem(
+        '2026-09-28T10:05:01.000Z',
+        'The following is the Codex agent history whose request action you are assessing.',
+      ),
+    ]);
+
+    const { parseCodexSessions } = await loadCodexParser(home);
+    const sessions = await parseCodexSessions();
+
+    expect(sessions.map((s) => s.id)).toEqual(['user-thread']);
+  });
+
+  it('collapses rollout segments of one thread into a single session keyed by the thread id', async () => {
+    const home = makeCodexHome();
+    const dir = path.join('sessions', '2026', '09', '28');
+    writeRollout(home, dir, 'rollout-2026-09-28T09-00-00-seg-thread.jsonl', [
+      { ...desktopMeta('seg-thread'), timestamp: '2026-09-28T09:00:00.000Z' },
+      userItem('2026-09-28T09:00:01.000Z', 'first segment request'),
+    ]);
+    const latest = writeRollout(home, dir, 'rollout-2026-09-28T10-00-00-seg-thread_seg-two.jsonl', [
+      { ...desktopMeta('seg-thread'), ordinal: 4089 },
+      userItem('2026-09-28T10:00:01.000Z', 'second segment request'),
+    ]);
+
+    const { parseCodexSessions } = await loadCodexParser(home);
+    const sessions = await parseCodexSessions();
+
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0].id).toBe('seg-thread');
+    expect(sessions[0].originalPath).toBe(latest);
+    expect(sessions[0].summary).toBe('second segment request');
+  });
+
+  it('reads commands and file changes from item_completed instead of the exec JS wrapper', async () => {
+    const home = makeCodexHome();
+    writeRollout(home, path.join('sessions', '2026', '09', '28'), 'rollout-2026-09-28T10-00-00-tools-thread.jsonl', [
+      desktopMeta('tools-thread'),
+      userItem('2026-09-28T10:00:01.000Z', '테스트 고쳐줘'),
+      {
+        timestamp: '2026-09-28T10:00:02.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'custom_tool_call',
+          status: 'completed',
+          call_id: 'call_1',
+          name: 'exec',
+          input:
+            'const r = await tools.exec_command({cmd: "npm test", workdir: "/tmp/desktop-project"});\ntext(r.output);',
+        },
+      },
+      {
+        timestamp: '2026-09-28T10:00:03.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'custom_tool_call_output',
+          call_id: 'call_1',
+          output: [{ type: 'input_text', text: 'Script completed\nOutput:\n1 failed' }],
+        },
+      },
+      completed('2026-09-28T10:00:03.000Z', {
+        type: 'CommandExecution',
+        id: 'exec-1',
+        command: ['/bin/bash', '-lc', 'npm test'],
+        cwd: 'file:///tmp/desktop-project',
+        parsed_cmd: [{ type: 'unknown', cmd: 'npm test' }],
+        source: 'unified_exec_startup',
+        status: 'failed',
+        stdout: '1 failed',
+        stderr: '',
+        aggregated_output: '1 failed',
+        exit_code: 1,
+      }),
+      completed('2026-09-28T10:00:04.000Z', {
+        type: 'FileChange',
+        id: 'exec-2',
+        status: 'completed',
+        changes: {
+          '/tmp/desktop-project/src/app.ts': {
+            type: 'update',
+            unified_diff: '@@ -1,2 +1,2 @@\n-const a = 1;\n+const a = 2;\n keep();\n',
+            move_path: null,
+          },
+          '/tmp/desktop-project/src/new.ts': { type: 'add', content: 'export const b = 1;\n' },
+        },
+      }),
+      completed('2026-09-28T10:00:05.000Z', {
+        type: 'McpToolCall',
+        id: 'exec-3',
+        server: 'codex_app',
+        tool: 'read_thread',
+        arguments: { threadId: 'x' },
+        status: 'completed',
+        result: { content: [{ type: 'text', text: 'thread body' }] },
+      }),
+      completed('2026-09-28T10:00:06.000Z', {
+        type: 'Extension',
+        kind: 'web.search',
+        id: 'exec-4',
+        query: 'mujoco convex hull',
+        action: { type: 'search', query: null, queries: ['mujoco convex hull'] },
+        results: [],
+      }),
+      {
+        timestamp: '2026-09-28T10:00:07.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'function_call',
+          name: 'wait',
+          arguments: '{"cell_id":"1","yield_time_ms":30000}',
+          call_id: 'call_2',
+        },
+      },
+      assistantItem('2026-09-28T10:00:08.000Z', '고쳤습니다.'),
+    ]);
+
+    const { parseCodexSessions, extractCodexContext } = await loadCodexParser(home);
+    const [session] = await parseCodexSessions();
+    const context = await extractCodexContext(session);
+
+    expect(context.filesModified.sort()).toEqual([
+      '/tmp/desktop-project/src/app.ts',
+      '/tmp/desktop-project/src/new.ts',
+    ]);
+
+    const byName = Object.fromEntries(context.toolSummaries.map((s) => [s.name, s]));
+    // the JS wrapper and the cell-polling helper are plumbing, not user-visible activity
+    expect(byName.exec).toBeUndefined();
+    expect(byName.wait).toBeUndefined();
+
+    const shell = context.toolSummaries.find((s) => s.samples.some((x) => x.summary.includes('$ npm test')));
+    expect(shell).toBeDefined();
+    expect(shell?.errorCount).toBe(1);
+
+    const allSamples = context.toolSummaries.flatMap((s) => s.samples.map((x) => x.summary)).join('\n');
+    expect(allSamples).toContain('src/app.ts');
+    expect(allSamples).toContain('src/new.ts');
+    expect(allSamples).toContain('codex_app');
+    expect(allSamples).toContain('mujoco convex hull');
+    expect(context.markdown).toContain('## Files Modified');
   });
 });

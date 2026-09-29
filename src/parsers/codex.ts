@@ -38,6 +38,52 @@ const MAX_EXACT_LINE_COUNT_BYTES = 1024 * 1024;
 const MAX_METADATA_SCAN_BYTES = 1024 * 1024;
 
 /**
+ * Context blocks Codex injects as `role: user` messages. They are not things the user typed.
+ */
+const INJECTED_USER_PREFIXES = [
+  '# AGENTS.md',
+  '<environment_context',
+  '<permissions',
+  '<user_instructions',
+  '<in-app-browser-context',
+  '<recommended_plugins',
+  '<turn_aborted',
+  '<skill',
+  '<image',
+  '<subagent_notification',
+];
+
+function isInjectedUserText(text: string): boolean {
+  const trimmed = text.trimStart();
+  return INJECTED_USER_PREFIXES.some((prefix) => trimmed.startsWith(prefix));
+}
+
+/** Join the user-typed text parts of a Codex `response_item` user message, dropping injected context. */
+function userTextFromContent(content: unknown): string {
+  if (!Array.isArray(content)) return '';
+  return content
+    .filter((part): part is { type: string; text: string } => {
+      const p = part as { type?: unknown; text?: unknown };
+      return p.type === 'input_text' && typeof p.text === 'string' && p.text.length > 0;
+    })
+    .map((part) => part.text)
+    .filter((text) => !isInjectedUserText(text))
+    .join('\n');
+}
+
+/**
+ * Subagent threads (e.g. Codex Desktop's `guardian_review` auto-approval reviewer) are spawned by a
+ * user thread and hold no user work of their own, so they are not offered as sessions.
+ */
+function isCodexSubagentSession(meta: CodexSessionMeta | null): boolean {
+  const payload = meta?.payload as Record<string, unknown> | undefined;
+  if (!payload) return false;
+  if (payload.thread_source === 'guardian_review') return true;
+  const source = payload.source;
+  return typeof source === 'object' && source !== null && 'subagent' in source;
+}
+
+/**
  * Find all Codex session files recursively
  */
 async function findSessionFiles(): Promise<string[]> {
@@ -79,6 +125,14 @@ async function parseSessionInfo(filePath: string): Promise<{
         firstUserMessage = typeof msg.content === 'string' ? (msg.content as string) : '';
       }
 
+      // Codex Desktop rollouts carry user turns only as response_item messages
+      if (!firstUserMessage && msg.type === 'response_item') {
+        const payload = msg.payload as Record<string, unknown> | undefined;
+        if (payload?.type === 'message' && payload.role === 'user') {
+          firstUserMessage = userTextFromContent(payload.content);
+        }
+      }
+
       if (meta && firstUserMessage) {
         return 'stop';
       }
@@ -116,6 +170,7 @@ export async function parseCodexSessions(options: SessionParseOptions = {}): Pro
       if (!parsed) return null;
 
       const { meta, firstUserMessage } = await parseSessionInfo(filePath);
+      if (isCodexSubagentSession(meta)) return null;
       const fileStats = fs.statSync(filePath);
       const stats =
         options.lightweight || fileStats.size > MAX_EXACT_LINE_COUNT_BYTES
@@ -138,7 +193,10 @@ export async function parseCodexSessions(options: SessionParseOptions = {}): Pro
       const summary = cleanSummary(firstUserMessage);
 
       return {
-        id: parsed.id,
+        // A long thread is split across rollout segments (`<thread-id>_<segment-id>.jsonl`) that all
+        // share the thread id from session_meta; keying by it collapses them to the latest segment
+        // and gives `codex resume` an id it accepts.
+        id: meta?.payload?.id || parsed.id,
         source: 'codex',
         cwd,
         repo,
@@ -240,6 +298,142 @@ function trackShellFileWrites(cmd: string, collector: SummaryCollector): void {
   }
 }
 
+function addShellCommand(collector: SummaryCollector, cmd: string, output?: string, knownExitCode?: number): void {
+  const baseCmd = cmd.trim().split(/\s+/)[0];
+  const category = COMMON_SHELL_TOOLS.has(baseCmd) ? baseCmd : 'shell';
+  const exitCode = knownExitCode ?? extractExitCode(output);
+  const errored = exitCode !== undefined && exitCode !== 0;
+  const stdoutTail = output ? extractStdoutTail(output, 5) : undefined;
+  const summary =
+    knownExitCode !== undefined ? `$ ${truncate(cmd, 80)} → exit ${knownExitCode}` : shellSummary(cmd, output);
+  collector.add(category, summary, {
+    data: {
+      category: 'shell',
+      command: cmd,
+      ...(exitCode !== undefined ? { exitCode } : {}),
+      ...(stdoutTail ? { stdoutTail } : {}),
+      ...(errored ? { errored } : {}),
+    },
+    isError: errored,
+  });
+  trackShellFileWrites(cmd, collector);
+}
+
+/** Item types Codex Desktop records in `event_msg` → `item_completed` for each tool it ran. */
+const STRUCTURED_TOOL_ITEMS = new Set(['CommandExecution', 'FileChange', 'McpToolCall', 'Extension', 'ImageView']);
+
+function completedItem(msg: CodexMessage): Record<string, unknown> | undefined {
+  if (msg.type !== 'event_msg') return undefined;
+  const payload = msg.payload as Record<string, unknown> | undefined;
+  if (payload?.type !== 'item_completed') return undefined;
+  const item = payload.item as Record<string, unknown> | undefined;
+  return item && typeof item.type === 'string' ? item : undefined;
+}
+
+/** `["/bin/bash", "-lc", "npm test"]` → `npm test` */
+function commandText(command: unknown): string {
+  if (typeof command === 'string') return command;
+  if (!Array.isArray(command)) return '';
+  const argv = command.map(String);
+  if (argv.length >= 3 && /(^|\/)(ba|z)?sh$/.test(argv[0]) && /^-l?c$/.test(argv[1])) return argv[2];
+  return argv.join(' ');
+}
+
+function stripFileUrl(value: unknown): string {
+  return typeof value === 'string' ? value.replace(/^file:\/\//, '') : '';
+}
+
+function toolOutputText(output: unknown): string {
+  if (typeof output === 'string') return output;
+  if (Array.isArray(output)) {
+    const texts = output
+      .map((part) => (part as { text?: unknown }).text)
+      .filter((text): text is string => typeof text === 'string');
+    if (texts.length > 0) return texts.join('\n');
+  }
+  return JSON.stringify(output);
+}
+
+function addStructuredItem(collector: SummaryCollector, item: Record<string, unknown>): void {
+  switch (item.type) {
+    case 'CommandExecution': {
+      const cmd = commandText(item.command);
+      if (!cmd) return;
+      const output =
+        typeof item.aggregated_output === 'string'
+          ? item.aggregated_output
+          : typeof item.stdout === 'string'
+            ? item.stdout
+            : undefined;
+      const exitCode = typeof item.exit_code === 'number' ? item.exit_code : item.status === 'failed' ? 1 : undefined;
+      addShellCommand(collector, cmd, output, exitCode);
+      return;
+    }
+    case 'FileChange': {
+      if (item.status === 'failed') return;
+      const changes = (item.changes ?? {}) as Record<string, Record<string, unknown>>;
+      for (const [filePath, change] of Object.entries(changes)) {
+        const kind = change?.type;
+        const isNewFile = kind === 'add';
+        const diff =
+          typeof change?.unified_diff === 'string'
+            ? change.unified_diff
+            : isNewFile && typeof change?.content === 'string'
+              ? change.content
+                  .split('\n')
+                  .map((line) => `+${line}`)
+                  .join('\n')
+              : undefined;
+        const diffStats = diff && !isNewFile ? countDiffStats(diff) : undefined;
+        const summary =
+          kind === 'delete'
+            ? `delete ${filePath}`
+            : fileSummary(isNewFile ? 'write' : 'edit', filePath, diffStats, isNewFile);
+        collector.add('apply_patch', summary, {
+          data: {
+            category: isNewFile ? 'write' : 'edit',
+            filePath,
+            ...(diff ? { diff } : {}),
+            ...(diffStats ? { diffStats } : {}),
+            ...(isNewFile ? { isNewFile } : {}),
+          },
+          filePath,
+          isWrite: true,
+        });
+        if (typeof change?.move_path === 'string' && change.move_path) collector.trackFile(change.move_path);
+      }
+      return;
+    }
+    case 'McpToolCall': {
+      const name = `mcp__${String(item.server ?? 'mcp')}__${String(item.tool ?? 'tool')}`;
+      const params = JSON.stringify(item.arguments ?? {}).slice(0, 100);
+      const result = item.result as { content?: unknown; isError?: unknown } | undefined;
+      const resultText = result?.content ? toolOutputText(result.content) : undefined;
+      collector.add(name, mcpSummary(name, params, resultText), {
+        data: {
+          category: 'mcp',
+          toolName: name,
+          params,
+          ...(resultText ? { result: resultText.slice(0, 100) } : {}),
+        },
+        isError: item.status === 'failed' || result?.isError === true,
+      });
+      return;
+    }
+    case 'Extension': {
+      if (item.kind !== 'web.search') return;
+      const action = item.action as { query?: unknown; queries?: unknown[] } | undefined;
+      const query = String(item.query || action?.query || action?.queries?.[0] || '');
+      collector.add('web_search', searchSummary(query), { data: { category: 'search', query } });
+      return;
+    }
+    case 'ImageView': {
+      collector.add('view_image', `image: ${truncate(stripFileUrl(item.path), 60)}`);
+      return;
+    }
+  }
+}
+
 /**
  * Extract tool usage summaries and files modified using shared SummaryCollector
  */
@@ -250,6 +444,11 @@ function extractToolData(
   const collector = new SummaryCollector(config);
   const outputsById = new Map<string, string>();
 
+  // Codex Desktop runs every tool from an `exec` JS cell and records each tool's structured result
+  // as an item_completed event. When those exist they are the source of truth, and the `exec` cell
+  // plus its `wait` poller are plumbing.
+  const hasStructuredItems = messages.some((msg) => STRUCTURED_TOOL_ITEMS.has(String(completedItem(msg)?.type)));
+
   // First pass: collect function_call_output and custom_tool_call_output by call_id
   for (const msg of messages) {
     if (msg.type !== 'response_item') continue;
@@ -259,15 +458,18 @@ function extractToolData(
       payload.call_id &&
       payload.output
     ) {
-      outputsById.set(
-        payload.call_id,
-        typeof payload.output === 'string' ? payload.output : JSON.stringify(payload.output),
-      );
+      outputsById.set(payload.call_id, toolOutputText(payload.output));
     }
   }
 
   // Second pass: extract tool calls
   for (const msg of messages) {
+    const item = completedItem(msg);
+    if (item) {
+      addStructuredItem(collector, item);
+      continue;
+    }
+
     if (msg.type === 'response_item') {
       const payload = msg.payload;
       if (!payload) continue;
@@ -281,25 +483,12 @@ function extractToolData(
           const name = namespace && !rawName.startsWith(namespace) ? `${namespace}${rawName}` : rawName;
           const output = payload.call_id ? outputsById.get(payload.call_id) : undefined;
 
-          if (name === 'exec_command' || name === 'shell_command') {
+          if (hasStructuredItems && name === 'wait') {
+            continue;
+          } else if (name === 'exec_command' || name === 'shell_command') {
             const cmd = String(args.cmd || args.command || '');
             if (!cmd) continue;
-            const baseCmd = cmd.trim().split(/\s+/)[0];
-            const category = COMMON_SHELL_TOOLS.has(baseCmd) ? baseCmd : 'shell';
-            const exitCode = extractExitCode(output);
-            const errored = exitCode !== undefined && exitCode !== 0;
-            const stdoutTail = output ? extractStdoutTail(output, 5) : undefined;
-            collector.add(category, shellSummary(cmd, output), {
-              data: {
-                category: 'shell',
-                command: cmd,
-                ...(exitCode !== undefined ? { exitCode } : {}),
-                ...(stdoutTail ? { stdoutTail } : {}),
-                ...(errored ? { errored } : {}),
-              },
-              isError: errored,
-            });
-            trackShellFileWrites(cmd, collector);
+            addShellCommand(collector, cmd, output);
           } else if (name === 'write_stdin') {
             const stdin = String(args.chars ?? args.input ?? args.data ?? '');
             collector.add('write_stdin', `stdin: "${truncate(stdin, 60)}"`);
@@ -358,7 +547,7 @@ function extractToolData(
       }
 
       // custom_tool_call (e.g. apply_patch)
-      if (payload.type === 'custom_tool_call' && payload.name) {
+      if (payload.type === 'custom_tool_call' && payload.name && !(hasStructuredItems && payload.name === 'exec')) {
         const name = payload.name;
         const input = payload.input || '';
         if (name === 'apply_patch') {
@@ -528,12 +717,10 @@ export async function extractCodexContext(session: UnifiedSession, config?: Verb
   for (const msg of messages) {
     if (msg.type === 'event_msg' && msg.payload) {
       const payload = msg.payload;
-      if (
-        payload.type === 'task_started' ||
-        payload.type === 'task_complete' ||
-        payload.type === 'turn_aborted' ||
-        payload.type === 'turn_completed'
-      ) {
+      // Start/complete markers arrive for every turn and would crowd real messages out of the
+      // Recent Conversation window; only an aborted turn tells the next agent something.
+      // All markers stay available in sessionNotes.lifecycle.
+      if (payload.type === 'turn_aborted') {
         lifecycleEvents.push({
           kind: 'lifecycle',
           sequence: lifecycleSequence++,
@@ -561,18 +748,9 @@ export async function extractCodexContext(session: UnifiedSession, config?: Verb
     } else if (msg.type === 'response_item') {
       const payload = msg.payload;
       if (payload?.role === 'user' && payload.type === 'message') {
-        const contentParts = payload.content || [];
-        const text = contentParts
-          .filter((c) => c.type === 'input_text' && c.text)
-          .map((c) => c.text)
-          .join('\n');
-        // Skip system-injected content (AGENTS.md instructions, environment_context, permissions)
-        if (
-          text &&
-          !text.startsWith('<environment_context>') &&
-          !text.startsWith('<permissions') &&
-          !text.startsWith('# AGENTS.md')
-        ) {
+        // Skip system-injected content (AGENTS.md instructions, environment_context, permissions, ...)
+        const text = userTextFromContent(payload.content);
+        if (text) {
           responseItemEntries.push({ role: 'user', content: text, timestamp: new Date(msg.timestamp) });
         }
       } else if (payload?.role === 'assistant' && payload.type === 'message') {
