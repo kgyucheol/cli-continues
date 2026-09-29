@@ -24,12 +24,14 @@ AI 코딩 도구를 쓰다가 토큰·사용량 한도에 걸리면, 지금까�
 [Node.js](https://nodejs.org) **22.5 이상**이 필요합니다 (`node --version`으로 확인).
 
 ```bash
-npm install -g github:kgyucheol/cli-continues
+npm install -g https://github.com/kgyucheol/cli-continues/releases/latest/download/continues.tgz
 ```
 
+- 미리 빌드된 최신 릴리스를 받아 설치하므로 추가 빌드가 필요 없습니다.
 - 설치하면 `continues`와 `cont` 명령을 쓸 수 있습니다. 확인: `continues --version` → `4.1.1-fork.1`
 - 원본(npm의 `continues`)이 이미 설치되어 있으면 이 버전으로 교체됩니다.
 - 업데이트는 같은 명령을 다시 실행하면 되고, 삭제는 `npm uninstall -g continues`입니다.
+- 설치 후 목록이 예전처럼 보이면 `continues rebuild`로 세션 색인을 새로 만드세요.
 
 ## 사용법
 
@@ -56,8 +58,9 @@ Claude Code · Codex · GitHub Copilot CLI · Gemini CLI · Cursor · Amp · Cli
 
 ```bash
 git clone https://github.com/kgyucheol/cli-continues && cd cli-continues
-pnpm install     # 설치 시 자동 빌드
-pnpm test
+pnpm install
+pnpm build && pnpm test
+node dist/cli.js list    # 빌드한 버전으로 실행
 ```
 
 ## 라이선스

@@ -20,7 +20,7 @@ Fork of [yigitkonur/cli-continues](https://github.com/yigitkonur/cli-continues) 
 
 ### Changed
 
-- `npm install -g github:kgyucheol/cli-continues` builds on install (`prepare` script); removed the stale v3.0.0 postinstall banner
+- Install from the prebuilt GitHub release (`npm install -g https://github.com/kgyucheol/cli-continues/releases/latest/download/continues.tgz`); removed the stale v3.0.0 postinstall banner
 
 ---
 
