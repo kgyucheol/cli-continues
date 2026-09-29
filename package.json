@@ -1,6 +1,6 @@
 {
   "name": "continues",
-  "version": "4.1.1",
+  "version": "4.1.1-fork.1",
   "description": "Never lose context. Resume any AI coding session across Claude Code, Codex, Copilot, Gemini CLI, Cursor, Amp, Cline, Roo Code, Kilo Code, Kiro, Crush, OpenCode, Droid & Antigravity.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -23,13 +23,13 @@
   ],
   "scripts": {
     "build": "tsc",
+    "prepare": "tsc",
     "dev": "tsx src/cli.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "start": "node dist/cli.js",
     "clean": "rm -rf dist",
     "prepublishOnly": "npm run build",
-    "postinstall": "echo '\n  continues v3.0.0 — Major refactor with typed schemas, library exports & Cursor support!\n  Run `continues list` to see all sessions.\n'",
     "lint": "biome check src/",
     "lint:fix": "biome check --write src/",
     "format": "biome format --write src/",
@@ -41,7 +41,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/yigitkonur/cli-continues.git"
+    "url": "git+https://github.com/kgyucheol/cli-continues.git"
   },
   "keywords": [
     "ai",
@@ -68,9 +68,9 @@
   "author": "Yigit Konur",
   "license": "MIT",
   "bugs": {
-    "url": "https://github.com/yigitkonur/cli-continues/issues"
+    "url": "https://github.com/kgyucheol/cli-continues/issues"
   },
-  "homepage": "https://github.com/yigitkonur/cli-continues#readme",
+  "homepage": "https://github.com/kgyucheol/cli-continues#readme",
   "engines": {
     "node": ">=22.5.0"
   },

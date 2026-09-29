@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [4.1.1-fork.1] - 2026-09-29
+
+Fork of [yigitkonur/cli-continues](https://github.com/yigitkonur/cli-continues) v4.1.1.
+
+### Fixed
+
+- **Codex Desktop rollouts (CLI 0.153+)** — tool activity is read from `item_completed` items (commands with exit codes, file changes with diffs, MCP calls, web search, image views) instead of the `exec` JS wrapper, so modified files are no longer reported as zero
+- **Codex session summaries** — taken from `response_item` user messages, skipping injected context blocks
+- **Codex subagent threads** — `guardian_review` auto-approval reviewers are no longer listed as sessions
+- **Codex rollout segments** — segments of one thread collapse into one session keyed by the thread id
+- **Codex Recent Conversation** — per-turn start/complete markers no longer crowd out messages
+
+### Changed
+
+- `npm install -g github:kgyucheol/cli-continues` builds on install (`prepare` script); removed the stale v3.0.0 postinstall banner
+
+---
+
 ## [4.1.0] - 2026-03-02
 
 ### Session Origin Tracking
